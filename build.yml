@@ -1,0 +1,315 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Generate project files
+        run: |
+          cat > README.md <<'EOF_0'
+          # Res Stretch (Shizuku)
+
+          1. Install Shizuku and start it (Wireless debugging on Android 11+, or root).
+          2. Open this folder in Android Studio, let Gradle sync, Run on your phone (or Build > Build APK).
+          3. Open the app > Grant permission > pick a preset.
+          4. A 10s confirm dialog appears; tap Keep, or it reverts automatically.
+
+          Values are in the phone's natural (portrait) orientation:
+          1080x1440 on a 1080x2400 screen = 4:3 stretch in landscape.
+          "Reset to native" restores size and density. Fallback via adb: `adb shell wm size reset`.
+          EOF_0
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_1'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.resstretch"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.resstretch"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          EOF_1
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_2'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <queries>
+                  <package android:name="moe.shizuku.privileged.api" />
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Res Stretch"
+                  android:theme="@style/Theme.ResStretch">
+
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:multiprocess="false"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_2
+          mkdir -p app/src/main/java/com/resstretch
+          cat > app/src/main/java/com/resstretch/MainActivity.kt <<'EOF_3'
+          package com.resstretch
+
+          import android.app.AlertDialog
+          import android.content.pm.PackageManager
+          import android.os.Bundle
+          import android.os.CountDownTimer
+          import android.text.InputType
+          import android.view.Gravity
+          import android.widget.*
+          import rikka.shizuku.Shizuku
+          import kotlin.concurrent.thread
+
+          class MainActivity : android.app.Activity() {
+
+              private lateinit var status: TextView
+              private lateinit var nativeInfo: TextView
+              private lateinit var wIn: EditText
+              private lateinit var hIn: EditText
+              private lateinit var presetBox: LinearLayout
+              private var nativeW = 0
+              private var nativeH = 0
+
+              private val permListener =
+                  Shizuku.OnRequestPermissionResultListener { _, _ -> runOnUiThread { refresh() } }
+              private val binderListener = Shizuku.OnBinderReceivedListener { runOnUiThread { refresh() } }
+              private val deadListener = Shizuku.OnBinderDeadListener { runOnUiThread { refresh() } }
+
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  Shizuku.addRequestPermissionResultListener(permListener)
+                  Shizuku.addBinderReceivedListenerSticky(binderListener)
+                  Shizuku.addBinderDeadListener(deadListener)
+                  buildUi()
+                  refresh()
+              }
+
+              override fun onDestroy() {
+                  Shizuku.removeRequestPermissionResultListener(permListener)
+                  Shizuku.removeBinderReceivedListener(binderListener)
+                  Shizuku.removeBinderDeadListener(deadListener)
+                  super.onDestroy()
+              }
+
+              // ---------- Shizuku ----------
+              private fun ready() = try {
+                  Shizuku.pingBinder() &&
+                      Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+              } catch (e: Throwable) { false }
+
+              private fun sh(cmd: String): String {
+                  val m = Shizuku::class.java.getDeclaredMethod(
+                      "newProcess",
+                      Array<String>::class.java, Array<String>::class.java, String::class.java
+                  ).apply { isAccessible = true }
+                  val p = m.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
+                  val out = p.inputStream.bufferedReader().readText() +
+                      p.errorStream.bufferedReader().readText()
+                  p.waitFor()
+                  return out.trim()
+              }
+
+              private fun bg(work: () -> Unit) = thread { try { work() } catch (e: Throwable) {
+                  runOnUiThread { toast("Error: ${e.message}") } } }
+
+              private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_LONG).show()
+
+              // ---------- Logic ----------
+              private fun refresh() {
+                  val ok = ready()
+                  status.text = when {
+                      !Shizuku.pingBinder() -> "Shizuku is NOT running. Open Shizuku and start it."
+                      !ok -> "Shizuku running, permission needed. Tap 'Grant permission'."
+                      else -> "Shizuku connected."
+                  }
+                  if (ok) bg {
+                      val out = sh("wm size")
+                      // "Physical size: 1080x2400" and maybe "Override size: 1080x1440"
+                      val m = Regex("Physical size: (\\d+)x(\\d+)").find(out)
+                      if (m != null) {
+                          nativeW = m.groupValues[1].toInt(); nativeH = m.groupValues[2].toInt()
+                          runOnUiThread {
+                              nativeInfo.text = "Output:\n$out"
+                              buildPresets()
+                              if (wIn.text.isEmpty()) { wIn.setText("$nativeW"); hIn.setText("$nativeH") }
+                          }
+                      }
+                  }
+              }
+
+              private fun even(n: Int) = n - (n % 2)
+
+              private fun applyRes(w: Int, h: Int) {
+                  if (!ready()) { toast("Shizuku not ready"); return }
+                  if (w < 400 || h < 400) { toast("Too small, refusing"); return }
+                  bg {
+                      val r = sh("wm size ${w}x${h}")
+                      runOnUiThread {
+                          if (r.isNotEmpty()) toast(r)
+                          confirmKeep()
+                      }
+                  }
+              }
+
+              private fun reset() {
+                  if (!ready()) { toast("Shizuku not ready"); return }
+                  bg { sh("wm size reset"); sh("wm density reset"); runOnUiThread { refresh(); toast("Reset to native") } }
+              }
+
+              private fun confirmKeep() {
+                  val d = AlertDialog.Builder(this)
+                      .setTitle("Keep this resolution?")
+                      .setMessage("Reverting in 10s...")
+                      .setCancelable(false)
+                      .setPositiveButton("Keep", null)
+                      .setNegativeButton("Revert") { _, _ -> reset() }
+                      .create()
+                  d.show()
+                  val t = object : CountDownTimer(10_000, 1000) {
+                      override fun onTick(ms: Long) { d.setMessage("Reverting in ${ms / 1000 + 1}s...") }
+                      override fun onFinish() { if (d.isShowing) { d.dismiss(); reset() } }
+                  }.start()
+                  d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener { t.cancel(); d.dismiss() }
+                  d.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener { t.cancel(); d.dismiss(); reset() }
+              }
+
+              // ---------- UI ----------
+              private fun buildPresets() {
+                  presetBox.removeAllViews()
+                  if (nativeW == 0) return
+                  // portrait-native phone: keep width, shorten height => stretched in landscape
+                  val w = minOf(nativeW, nativeH)
+                  val h = maxOf(nativeW, nativeH)
+                  val presets = listOf(
+                      "4:3" to 4.0 / 3, "5:4" to 5.0 / 4, "3:2" to 3.0 / 2,
+                      "16:10" to 16.0 / 10, "16:9" to 16.0 / 9
+                  )
+                  for ((name, ratio) in presets) {
+                      val ph = even((w * ratio).toInt())
+                      if (ph >= h) continue
+                      presetBox.addView(Button(this).apply {
+                          text = "$name  (${w}x$ph)"
+                          setOnClickListener { wIn.setText("$w"); hIn.setText("$ph"); applyRes(w, ph) }
+                      })
+                  }
+              }
+
+              private fun buildUi() {
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setPadding(pad, pad * 2, pad, pad)
+                  }
+                  status = TextView(this).apply { textSize = 16f }
+                  nativeInfo = TextView(this).apply { textSize = 13f }
+                  val grant = Button(this).apply {
+                      text = "Grant permission"
+                      setOnClickListener {
+                          try {
+                              if (!Shizuku.pingBinder()) toast("Start Shizuku first")
+                              else Shizuku.requestPermission(0)
+                          } catch (e: Throwable) { toast(e.message ?: "error") }
+                      }
+                  }
+                  presetBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+                  wIn = EditText(this).apply { hint = "Width"; inputType = InputType.TYPE_CLASS_NUMBER }
+                  hIn = EditText(this).apply { hint = "Height"; inputType = InputType.TYPE_CLASS_NUMBER }
+                  val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                  row.addView(wIn, LinearLayout.LayoutParams(0, -2, 1f))
+                  row.addView(TextView(this).apply { text = " x " })
+                  row.addView(hIn, LinearLayout.LayoutParams(0, -2, 1f))
+
+                  val custom = Button(this).apply {
+                      text = "Apply custom"
+                      setOnClickListener {
+                          val w = wIn.text.toString().toIntOrNull(); val h = hIn.text.toString().toIntOrNull()
+                          if (w == null || h == null) toast("Enter width and height") else applyRes(w, h)
+                      }
+                  }
+                  val resetBtn = Button(this).apply { text = "Reset to native"; setOnClickListener { reset() } }
+
+                  listOf(status, grant, nativeInfo, TextView(this).apply { text = "\nPresets (landscape stretch)"; textSize = 16f },
+                      presetBox, TextView(this).apply { text = "\nCustom (portrait-native values)" }, row, custom, resetBtn
+                  ).forEach { root.addView(it) }
+
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+          }
+          EOF_3
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'EOF_4'
+          <resources>
+              <style name="Theme.ResStretch" parent="android:Theme.Material.NoActionBar" />
+          </resources>
+          EOF_4
+          cat > build.gradle.kts <<'EOF_5'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_5
+          cat > gradle.properties <<'EOF_6'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_6
+          cat > settings.gradle.kts <<'EOF_7'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "ResStretch"
+          include(":app")
+          EOF_7
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ResStretch-APK
+          path: app/build/outputs/apk/debug/*.apk
